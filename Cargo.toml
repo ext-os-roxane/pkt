@@ -1,0 +1,20 @@
+[package]
+name = "pkt"
+description = "ExtOS package and repository engine — fetcher, CAS manager, P2P swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pkt"
+path = "src/main.rs"
+
+[dependencies]
+libextos = { path = "../libextos" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
