@@ -128,6 +128,10 @@ struct QueryArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
 
+    /// List every ref row (`origin/name version -> hash`), including all versions
+    #[arg(long)]
+    all_refs: bool,
+
     /// Packages to query
     packages: Vec<String>,
 }
@@ -152,6 +156,9 @@ struct UpgradeArgs {
     files: Vec<String>,
 }
 
+/// Origin assumed for a bare package name (`pkt -S htop=3.3.0-1`).
+const DEFAULT_SYNC_ORIGIN: &str = "archlinux";
+
 fn parse_hash_algo(s: &str) -> HashAlgorithm {
     match s {
         "sha256" | "SHA256" => HashAlgorithm::Sha256,
@@ -159,18 +166,115 @@ fn parse_hash_algo(s: &str) -> HashAlgorithm {
     }
 }
 
-/// Auto-detect origin from archive kind.
-fn detect_origin(kind: ArchiveKind) -> &'static str {
-    match kind {
-        ArchiveKind::PkgTarZst | ArchiveKind::PkgTarXz => "archlinux",
-        ArchiveKind::Deb => "debian",
-        ArchiveKind::Apk => "alpine",
-        ArchiveKind::PktTarXz => "scratch",
+/// Abbreviate a CAS hash for terminal display (never panics on short input).
+fn short_hash(hash: &str) -> &str {
+    let end = std::cmp::min(20, hash.len());
+    &hash[..end]
+}
+
+/// Parse a `-S` package spec: `[origin/]name[=version]`.
+///
+/// A bare name is attributed to [`DEFAULT_SYNC_ORIGIN`]. The version is
+/// mandatory because mirror index resolution does not exist yet — the download
+/// URL is derived from `<name>-<version>` (see `ingest::package_filename`).
+fn parse_sync_spec(spec: &str) -> anyhow::Result<(String, String, String)> {
+    let (locator, version) = match spec.split_once('=') {
+        Some((locator, version)) => (locator.trim(), Some(version.trim())),
+        None => (spec.trim(), None),
+    };
+
+    let (origin, name) = match locator.split_once('/') {
+        Some((origin, name)) => {
+            if origin.is_empty() || name.is_empty() || name.contains('/') {
+                anyhow::bail!(
+                    "invalid package spec '{spec}': expected `[origin/]name[=version]`"
+                );
+            }
+            (origin.to_string(), name.to_string())
+        }
+        None => {
+            if locator.is_empty() {
+                anyhow::bail!("invalid package spec '{spec}': package name is empty");
+            }
+            (DEFAULT_SYNC_ORIGIN.to_string(), locator.to_string())
+        }
+    };
+
+    let version = version.filter(|v| !v.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "package '{origin}/{name}' needs an explicit version, e.g. \
+             `{origin}/{name}=1.2.3-1` (mirror index resolution is not implemented)"
+        )
+    })?;
+
+    Ok((origin, name, version.to_string()))
+}
+
+/// Download one package from its configured mirrors, then ingest it into the CAS.
+///
+/// With `download_only` the archive is left in `<repository>/cache/` and the
+/// ingest/commit steps are skipped (pacman's `-S -w`).
+fn sync_one_package(
+    repo: &CasRepository,
+    cache_dir: &Path,
+    spec: &str,
+    rosetta: &RosettaRegistry,
+    download_only: bool,
+) -> anyhow::Result<()> {
+    let (origin, name, version) = parse_sync_spec(spec)?;
+
+    let archive = ingest::download_from_mirror_to(&origin, &name, &version, cache_dir)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "cannot fetch {origin}/{name} {version}: {err}\n\
+                 hint: set {} to one or more comma-separated mirror base URLs",
+                ingest::mirror_env_var(&origin)
+            )
+        })?;
+
+    let bytes = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+    println!("↓ {} ({} bytes)", archive.display(), bytes);
+
+    if download_only {
+        return Ok(());
+    }
+
+    let result =
+        ingest::ingest_local_archive_with_rosetta(repo, &archive, &origin, Some(rosetta))?;
+    let tag = if result.rosetta_translated {
+        " [rosetta]"
+    } else {
+        ""
+    };
+    println!(
+        "✓ {}/{} {} → {}{}",
+        result.origin,
+        result.name,
+        result.version,
+        short_hash(&result.hash),
+        tag
+    );
+    print_capabilities(&result.capabilities);
+    Ok(())
+}
+
+/// Print the auto-discovered ELF capabilities of an ingested package.
+fn print_capabilities(capabilities: &libextos::manifest::Capabilities) {
+    if !capabilities.binaries.is_empty() {
+        println!("  binaries: {}", capabilities.binaries.join(", "));
+    }
+    if !capabilities.libraries.is_empty() {
+        println!("  libraries: {}", capabilities.libraries.join(", "));
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Plain synchronous entry point.
+///
+/// The download/ingest stack is built on `reqwest::blocking` (see
+/// `libextos::ingest`). Running it from inside a Tokio runtime panics with
+/// "Cannot drop a runtime in a context where blocking is not allowed", so `pkt`
+/// must NOT install an async runtime here.
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
@@ -231,14 +335,38 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else if !args.packages.is_empty() {
+                let repo = CasRepository::open(&cli.repository, algo)?;
+                let cache_dir = repo.root.join("cache");
                 tracing::info!("Installing: {:?}", args.packages);
-                todo!("M3.6/M4: Remote sync + fetch + ingest pipeline")
+                let mut failures = 0usize;
+                for spec in &args.packages {
+                    if let Err(err) =
+                        sync_one_package(&repo, &cache_dir, spec, &rosetta, args.downloadonly)
+                    {
+                        eprintln!("error: {err}");
+                        failures += 1;
+                    }
+                }
+                if failures > 0 {
+                    anyhow::bail!("{failures} package(s) failed to sync");
+                }
             }
             Ok(())
         }
         Operation::Query(args) => {
             let repo = CasRepository::open(&cli.repository, algo)?;
-            if args.packages.is_empty() {
+            if args.all_refs {
+                let rows = repo.list_refs()?;
+                if rows.is_empty() {
+                    println!("No refs in repository.");
+                }
+                for row in rows {
+                    match repo.resolve_ref(&row.origin, &row.name, &row.version) {
+                        Ok(hash) => println!("{} → {}", row.label(), short_hash(&hash)),
+                        Err(_) => println!("{} → (dangling)", row.label()),
+                    }
+                }
+            } else if args.packages.is_empty() {
                 // List all installed packages
                 let origins = repo.list_origins()?;
                 for origin in &origins {
@@ -250,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Ok(hash) = repo.resolve_ref(origin, &pkg, "current") {
                             let versions = repo.list_versions(origin, &pkg)?;
                             let current = versions.last().cloned().unwrap_or_default();
-                            println!("{}/{} {} [{}]", origin, pkg, current, &hash[..16]);
+                            println!("{}/{} {} [{}]", origin, pkg, current, short_hash(&hash));
                         }
                     }
                 }
@@ -285,27 +413,82 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Operation::Remove(args) => {
+            if args.packages.is_empty() {
+                anyhow::bail!(
+                    "no packages specified (usage: pkt -R <package> [<package>...])"
+                );
+            }
             let repo = CasRepository::open(&cli.repository, algo)?;
-            for pkg_name in &args.packages {
-                tracing::info!("Removing: {}", pkg_name);
-                // Find and remove all refs for this package
-                let origins = repo.list_origins()?;
-                for origin in &origins {
-                    let versions = repo.list_versions(origin, pkg_name)?;
-                    if !versions.is_empty() {
-                        let ref_dir = repo.root.join("refs").join(origin).join(pkg_name);
-                        std::fs::remove_dir_all(&ref_dir)?;
-                        println!("Removed {}/{} ({} versions)", origin, pkg_name, versions.len());
+            // Snapshot the ref table once: removal must be driven by the refs
+            // listing, not by directory guesses (PLAN 2.2.3).
+            let rows = repo.list_refs()?;
+            let mut missing: Vec<&str> = Vec::new();
+            let mut removed_total = 0usize;
+
+            for spec in &args.packages {
+                let (origin_filter, name) = match spec.split_once('/') {
+                    Some((origin, name)) if !origin.is_empty() && !name.is_empty() => {
+                        (Some(origin), name)
+                    }
+                    _ => (None, spec.as_str()),
+                };
+
+                // Every (origin, name) pair the ref table knows for this spec.
+                let mut targets: Vec<(String, String)> = Vec::new();
+                for row in &rows {
+                    if row.name != name {
+                        continue;
+                    }
+                    if origin_filter.is_some_and(|origin| origin != row.origin) {
+                        continue;
+                    }
+                    let pair = (row.origin.clone(), row.name.clone());
+                    if !targets.contains(&pair) {
+                        targets.push(pair);
                     }
                 }
+
+                if targets.is_empty() {
+                    eprintln!("error: package '{spec}' was not found");
+                    missing.push(spec);
+                    continue;
+                }
+
+                for (origin, pkg) in targets {
+                    tracing::info!("Removing: {}/{}", origin, pkg);
+                    let versions = repo.list_versions(&origin, &pkg)?;
+                    for version in &versions {
+                        println!("Removed {}/{}/{}", origin, pkg, version);
+                    }
+                    // Drop the whole ref directory: all versions plus `current`.
+                    let ref_dir = repo.root.join("refs").join(&origin).join(&pkg);
+                    std::fs::remove_dir_all(&ref_dir)?;
+                    println!(
+                        "{}/{}: removed {} version(s)",
+                        origin,
+                        pkg,
+                        versions.len()
+                    );
+                    removed_total += versions.len();
+                }
             }
+
             if args.recursive {
                 tracing::info!("Running GC to remove orphaned objects...");
-                let purged = repo.gc()?;
+                let purged = repo.garbage_collect()?;
                 if !purged.is_empty() {
                     println!("GC: purged {} orphaned objects", purged.len());
                 }
             }
+
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "{} package(s) not found: {}",
+                    missing.len(),
+                    missing.join(", ")
+                );
+            }
+            tracing::info!("Removed {} version ref(s) in total", removed_total);
             Ok(())
         }
         Operation::Upgrade(args) => {
@@ -329,15 +512,19 @@ async fn main() -> anyhow::Result<()> {
                         result.origin,
                         result.name,
                         result.version,
-                        &result.hash[..20]
+                        short_hash(&result.hash)
                     );
                 } else {
                     // Upstream package — use Rosetta plugin dispatch
-                    let origin = args.origin.as_deref().unwrap_or_else(|| {
-                        kind.map(detect_origin).unwrap_or("scratch")
-                    });
+                    let origin = args
+                        .origin
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            kind.map(ingest::default_origin_for_archive)
+                                .unwrap_or("scratch")
+                        });
                     tracing::info!("Ingesting {} package: {}", origin, file_path);
-                    let result = ingest::ingest_package_with_rosetta(
+                    let result = ingest::ingest_local_archive_with_rosetta(
                         &repo, path, origin, Some(&rosetta),
                     )?;
                     let tag = if result.rosetta_translated { " [rosetta]" } else { "" };
@@ -346,21 +533,10 @@ async fn main() -> anyhow::Result<()> {
                         result.origin,
                         result.name,
                         result.version,
-                        &result.hash[..20],
+                        short_hash(&result.hash),
                         tag
                     );
-                    if !result.capabilities.binaries.is_empty() {
-                        println!(
-                            "  binaries: {}",
-                            result.capabilities.binaries.join(", ")
-                        );
-                    }
-                    if !result.capabilities.libraries.is_empty() {
-                        println!(
-                            "  libraries: {}",
-                            result.capabilities.libraries.join(", ")
-                        );
-                    }
+                    print_capabilities(&result.capabilities);
                 }
             }
             Ok(())
@@ -368,14 +544,33 @@ async fn main() -> anyhow::Result<()> {
         Operation::Files { query } => {
             let repo = CasRepository::open(&cli.repository, algo)?;
             tracing::info!("Searching for file: {}", query);
-            let origins = repo.list_origins()?;
-            for origin in &origins {
-                let pkgs = repo.list_packages(origin)?;
-                for pkg in &pkgs {
-                    if let Ok(hash) = repo.resolve_ref(origin, &pkg, "current") {
-                        let content_dir = repo.retrieve(&hash)?;
-                        if find_file_in_tree(&content_dir, &query)? {
-                            println!("{}/{} owns a file matching '{}'", origin, pkg, query);
+            match repo.search_files(&query) {
+                Ok(hits) => {
+                    for hit in hits {
+                        println!(
+                            "{}/{} {} {}",
+                            hit._ref.origin, hit._ref.name, hit._ref.version, hit.path
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Legacy fallback: the ref-driven scan could not read a
+                    // content tree, so walk `current` trees directly. Bounded
+                    // to this failure path — the normal route never scans.
+                    tracing::warn!("CAS file scan failed ({err}); falling back to tree scan");
+                    let origins = repo.list_origins()?;
+                    for origin in &origins {
+                        let pkgs = repo.list_packages(origin)?;
+                        for pkg in &pkgs {
+                            if let Ok(hash) = repo.resolve_ref(origin, &pkg, "current") {
+                                let content_dir = repo.retrieve(&hash)?;
+                                if find_file_in_tree(&content_dir, &query)? {
+                                    println!(
+                                        "{}/{} owns a file matching '{}'",
+                                        origin, pkg, query
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -386,13 +581,13 @@ async fn main() -> anyhow::Result<()> {
             let repo = CasRepository::open(&cli.repository, algo)?;
             if gc {
                 tracing::info!("Running garbage collection...");
-                let purged = repo.gc()?;
+                let purged = repo.garbage_collect()?;
                 if purged.is_empty() {
                     println!("No orphaned objects found.");
                 } else {
                     println!("Purged {} objects:", purged.len());
                     for hash in &purged {
-                        println!("  - {}", &hash[..std::cmp::min(20, hash.len())]);
+                        println!("  - {}", short_hash(hash));
                     }
                 }
             }
