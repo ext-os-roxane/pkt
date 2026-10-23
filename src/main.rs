@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, Args};
 
+use libextos::caps::CapabilityIndex;
 use libextos::cas::CasRepository;
 use libextos::extract::ArchiveKind;
 use libextos::ingest;
@@ -46,12 +47,9 @@ enum Operation {
     #[command(name = "-U", alias = "upgrade")]
     Upgrade(UpgradeArgs),
 
-    /// Check the files database (-F)
+    /// Check the files database (-F); `--soname` queries the capability index
     #[command(name = "-F", alias = "files")]
-    Files {
-        /// Search for a file
-        query: String,
-    },
+    Files(FilesArgs),
 
     /// Modify the local package database (-D)
     #[command(name = "-D", alias = "database")]
@@ -144,6 +142,23 @@ struct RemoveArgs {
 
     /// Packages to remove
     packages: Vec<String>,
+}
+
+#[derive(Args)]
+struct FilesArgs {
+    /// File path or glob to search for in the CAS file database (-F).
+    ///
+    /// Matching rules live in [`libextos::cas::matches_query`]; a plain string is
+    /// a case-sensitive substring, `/x` is anchored, `*`/`?` glob one segment.
+    query: Option<String>,
+
+    /// Query the SONAME capability index for providers instead (PLAN 5.2.4).
+    ///
+    /// Kept as an explicit flag because `-F <query>` is the Phase-2 file search
+    /// (`src/cas.rs::search_files`); overloading the positional would silently
+    /// change the meaning of existing invocations.
+    #[arg(long, visible_alias = "providers")]
+    soname: Option<String>,
 }
 
 #[derive(Args)]
@@ -541,34 +556,48 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Operation::Files { query } => {
+        Operation::Files(args) => {
             let repo = CasRepository::open(&cli.repository, algo)?;
-            tracing::info!("Searching for file: {}", query);
-            match repo.search_files(&query) {
-                Ok(hits) => {
-                    for hit in hits {
-                        println!(
-                            "{}/{} {} {}",
-                            hit._ref.origin, hit._ref.name, hit._ref.version, hit.path
-                        );
-                    }
-                }
-                Err(err) => {
-                    // Legacy fallback: the ref-driven scan could not read a
-                    // content tree, so walk `current` trees directly. Bounded
-                    // to this failure path — the normal route never scans.
-                    tracing::warn!("CAS file scan failed ({err}); falling back to tree scan");
-                    let origins = repo.list_origins()?;
-                    for origin in &origins {
-                        let pkgs = repo.list_packages(origin)?;
-                        for pkg in &pkgs {
-                            if let Ok(hash) = repo.resolve_ref(origin, &pkg, "current") {
-                                let content_dir = repo.retrieve(&hash)?;
-                                if find_file_in_tree(&content_dir, &query)? {
-                                    println!(
-                                        "{}/{} owns a file matching '{}'",
-                                        origin, pkg, query
-                                    );
+            match (args.query.as_deref(), args.soname.as_deref()) {
+                (None, None) => anyhow::bail!(
+                    "no query specified (usage: pkt -F <file-query> | pkt -F --soname <soname>)"
+                ),
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "choose either a file query or --soname, not both \
+                     (usage: pkt -F <file-query> | pkt -F --soname <soname>)"
+                ),
+                (None, Some(soname)) => print_capability_providers(&repo, soname)?,
+                (Some(query), None) => {
+                    tracing::info!("Searching for file: {}", query);
+                    match repo.search_files(query) {
+                        Ok(hits) => {
+                            for hit in hits {
+                                println!(
+                                    "{}/{} {} {}",
+                                    hit._ref.origin, hit._ref.name, hit._ref.version, hit.path
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // Legacy fallback: the ref-driven scan could not read a
+                            // content tree, so walk `current` trees directly. Bounded
+                            // to this failure path — the normal route never scans.
+                            tracing::warn!(
+                                "CAS file scan failed ({err}); falling back to tree scan"
+                            );
+                            let origins = repo.list_origins()?;
+                            for origin in &origins {
+                                let pkgs = repo.list_packages(origin)?;
+                                for pkg in &pkgs {
+                                    if let Ok(hash) = repo.resolve_ref(origin, &pkg, "current") {
+                                        let content_dir = repo.retrieve(&hash)?;
+                                        if find_file_in_tree(&content_dir, query)? {
+                                            println!(
+                                                "{}/{} owns a file matching '{}'",
+                                                origin, pkg, query
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -640,6 +669,50 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Print the providers of one SONAME from the CAS capability index (PLAN 5.2.4).
+///
+/// The whole repository is indexed on demand (PLAN 5.2.2) — no daemon, no cache,
+/// no network. Rows the population had to skip are reported on stderr so a
+/// short provider list is never mistaken for "nobody provides this". A miss
+/// prints `no providers for <soname>` and exits 0, matching the quiet-miss
+/// behaviour of the file search (`-F <query>`) and of `-Q --all-refs`; only a
+/// malformed SONAME or an unreadable CAS is an error (exit 1).
+fn print_capability_providers(repo: &CasRepository, soname: &str) -> anyhow::Result<()> {
+    let populated = CapabilityIndex::populate(repo)?;
+    for warning in &populated.summary.warnings {
+        eprintln!("warning: skipped {warning}");
+    }
+
+    // `query` validates the SONAME (path separators, NUL, control characters)
+    // before any lookup: a malformed key is a typed error, not an empty result.
+    let providers = populated.index.query(soname)?;
+    if providers.is_empty() {
+        println!("no providers for {soname}");
+        return Ok(());
+    }
+
+    println!("{soname}:");
+    for provider in providers {
+        match &provider.object {
+            Some(hash) => println!(
+                "  {} {} → {}",
+                provider.label(),
+                provider.version,
+                short_hash(hash)
+            ),
+            None => println!("  {} {}", provider.label(), provider.version),
+        }
+    }
+    println!("{} provider(s) for {}", providers.len(), soname);
+    println!(
+        "indexed {} SONAME(s) across {} ref(s) ({} warning(s))",
+        populated.summary.sonames,
+        populated.summary.refs_scanned,
+        populated.summary.warnings.len()
+    );
+    Ok(())
 }
 
 /// Recursively list files in a directory tree.
