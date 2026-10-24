@@ -9,6 +9,8 @@ use libextos::ingest;
 use libextos::rosetta::registry::RosettaRegistry;
 use libextos::types::HashAlgorithm;
 
+mod server;
+
 /// pkt — ExtOS Package & Repository Engine (Pacman-style)
 ///
 /// Manages the Content-Addressable Storage repository,
@@ -83,6 +85,19 @@ enum Operation {
     Verify {
         /// Optional: specific hash to verify (otherwise verify all)
         hash: Option<String>,
+    },
+
+    /// Serve the pkt control plane over a Unix domain socket (PLAN 8.1.3)
+    Serve {
+        /// Path to the gRPC control socket. Overrides `EXTOS_PKT_SOCKET`;
+        /// defaults to the ARCHITECTURE §15 path (`server::DEFAULT_SOCKET`).
+        #[arg(long, env = "EXTOS_PKT_SOCKET")]
+        socket: Option<PathBuf>,
+        /// Control-socket group override (PLAN 8.1.5). Defaults to the §15
+        /// daemon group (`wheel`, from `libextos::daemons::DEFAULT_SOCKETS`);
+        /// `none` (or an empty value) disables the chown entirely.
+        #[arg(long)]
+        group: Option<String>,
     },
 }
 
@@ -289,6 +304,11 @@ fn print_capabilities(capabilities: &libextos::manifest::Capabilities) {
 /// `libextos::ingest`). Running it from inside a Tokio runtime panics with
 /// "Cannot drop a runtime in a context where blocking is not allowed", so `pkt`
 /// must NOT install an async runtime here.
+///
+/// The one sanctioned exception is `pkt serve` (PLAN 8.1.3, `mod server`): it
+/// builds its own explicit multi-thread Tokio runtime and bridges every
+/// blocking domain call through `tokio::task::spawn_blocking`, whose worker
+/// threads permit blocking drops — the CLI's sync main is otherwise unchanged.
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
@@ -666,6 +686,18 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Operation::Serve { socket, group } => {
+            let socket = socket.unwrap_or_else(|| PathBuf::from(server::DEFAULT_SOCKET));
+            tracing::info!("Serving pkt control plane on {}", socket.display());
+            match group.as_deref() {
+                // The §15 default (`wheel`) applies when no flag was given.
+                Some(flag) => {
+                    server::serve_with_group(&cli.repository, algo, &socket, rosetta, Some(flag))?
+                }
+                None => server::serve(&cli.repository, algo, &socket, rosetta)?,
+            };
             Ok(())
         }
     }
